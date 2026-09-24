@@ -1,0 +1,267 @@
+# Build, test and pack NetOcc on all four RIDs; a v* tag also publishes to nuget.org and creates the GitHub release.
+#
+# One-time setup for publishing (see .claude/skills/release/SKILL.md):
+#   - nuget.org > Trusted Publishing: owner paulbuechner, repository netocc-core, workflow build.yml, environment release
+#   - repository variable NUGET_USER: the nuget.org profile name that owns the policy
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# main is force-pushed after every amend: a newer push cancels the run in flight, a release tag never is
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  PYTHONUTF8: "1"
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # a release tag needs its CHANGELOG.md section; other builds pack the [Unreleased] one
+      - id: version
+        name: version and release notes
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            python build.py changelog --version "$version" --output release-notes.md
+          else
+            version="0.0.0-ci.${GITHUB_RUN_NUMBER}"
+            python build.py changelog --output release-notes.md
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "NetOcc $version" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  natives:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025, triplet: x64-windows, rid: win-x64, arch: x64 }
+          - { os: windows-2025, triplet: x86-windows, rid: win-x86, arch: x86 }
+          # 22.04: glibc 2.35 is the oldest the Linux natives load on
+          - { os: ubuntu-22.04, triplet: x64-linux-dynamic, rid: linux-x64, arch: x64 }
+          - { os: macos-15, triplet: arm64-osx-dynamic, rid: osx-arm64, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-tool
+      # the registry baseline in vcpkg-configuration.json: the tool's scripts match the ports
+      VCPKG_COMMIT: dc1232a6e05dcc49703091e83743e3b4df9b9b7c
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
+            10.0.x
+
+      - name: build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get install -y --no-install-recommends autoconf autoconf-archive automake libtool pkg-config \
+            libgl1-mesa-dev libglu1-mesa-dev libx11-dev libxext-dev libxi-dev
+      - name: build tools (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install pkg-config
+      - name: ninja
+        run: python -m pip install --disable-pip-version-check ninja
+
+      # CLR 2 for the net35 tests; build.py test skips them with a warning if this doesn't take
+      - name: .NET Framework 3.5
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3).State -ne 'Enabled') {
+            Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart
+          }
+
+      - name: vcpkg
+        shell: bash
+        run: |
+          git init --quiet "$VCPKG_ROOT"
+          git -C "$VCPKG_ROOT" fetch --quiet --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_COMMIT"
+          git -C "$VCPKG_ROOT" checkout --quiet FETCH_HEAD
+          if [ "$RUNNER_OS" = "Windows" ]; then "$VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics; else "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics; fi
+
+      # the binary cache is saved right after the OCCT build, so a failing test later doesn't throw hours of OCCT away
+      - id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .vcpkg/archives
+          key: vcpkg-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', format('vcpkg/triplets/{0}.cmake', matrix.triplet)) }}
+          restore-keys: vcpkg-${{ matrix.triplet }}-
+
+      - name: OCCT
+        shell: bash
+        run: |
+          python build.py tools
+          python build.py occt --triplet ${{ matrix.triplet }}
+
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .vcpkg/archives
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: SWIG and native shim
+        shell: bash
+        run: |
+          python build.py generate
+          python build.py native --triplet ${{ matrix.triplet }}
+
+      # x86: the .NET Framework targets (net48, net35 on CLR 2); the runners have no x86 .NET 6/8/10
+      - name: test
+        shell: bash
+        run: |
+          if [ "${{ matrix.arch }}" = "x86" ]; then
+            python build.py test --arch x86 --framework net48
+            python build.py test --arch x86 --framework net35
+          else
+            python build.py test --arch ${{ matrix.arch }}
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.rid }}
+          path: artifacts/runtimes/${{ matrix.rid }}
+          if-no-files-found: error
+
+  pack:
+    needs: [version, natives]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/download-artifact@v8
+        with:
+          name: win-x64
+          path: artifacts/runtimes/win-x64
+      - uses: actions/download-artifact@v8
+        with:
+          name: win-x86
+          path: artifacts/runtimes/win-x86
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-x64
+          path: artifacts/runtimes/linux-x64
+      - uses: actions/download-artifact@v8
+        with:
+          name: osx-arm64
+          path: artifacts/runtimes/osx-arm64
+      - name: pack
+        shell: bash
+        run: |
+          python build.py tools
+          python build.py generate
+          python build.py pack --version "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: artifacts/packages
+          if-no-files-found: error
+
+  package-tests:
+    needs: [version, pack]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025, arch: x64 }
+          - { os: ubuntu-24.04, arch: x64 }
+          - { os: macos-15, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: artifacts/packages
+      - name: test the packages
+        shell: bash
+        run: python build.py test-package --arch ${{ matrix.arch }}
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, package-tests]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write   # the GitHub release
+      id-token: write   # nuget.org Trusted Publishing
+    steps:
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: artifacts/packages
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: .
+      # the temporary API key lives for an hour: log in right before the push
+      - id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - name: push to nuget.org
+        shell: bash
+        run: |
+          dotnet nuget push "artifacts/packages/*.nupkg" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          prerelease=""
+          if [[ "$VERSION" == *-* ]]; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" artifacts/packages/*.nupkg --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "NetOcc $VERSION" --notes-file release-notes.md $prerelease
