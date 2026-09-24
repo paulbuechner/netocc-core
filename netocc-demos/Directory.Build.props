@@ -1,0 +1,14 @@
+<Project>
+
+  <!-- the packed NetOcc: netocc-core's build.py pack writes its version here, next to the packages nuget.config reads -->
+  <Import Project="$(MSBuildThisFileDirectory)..\netocc-core\artifacts\packages\NetOcc.version.props"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\netocc-core\artifacts\packages\NetOcc.version.props')" />
+
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

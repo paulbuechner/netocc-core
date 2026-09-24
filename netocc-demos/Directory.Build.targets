@@ -1,0 +1,8 @@
+<Project>
+
+  <Target Name="NetOccRequirePackage" BeforeTargets="_LoadRestoreGraphEntryPoints;Build">
+    <Error Condition="'$(NetOccPackageVersion)' == ''"
+           Text="No packed NetOcc: run 'python build.py pack --rids win-x64,win-x86' in netocc-core first." />
+  </Target>
+
+</Project>

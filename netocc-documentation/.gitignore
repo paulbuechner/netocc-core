@@ -1,0 +1,9 @@
+# docfx output and caches
+_site/
+obj/
+
+# written by classes.py from netocc-core's classes.json
+classes/
+
+__pycache__/
+/log/

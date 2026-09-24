@@ -1,0 +1,25 @@
+# tools (micromamba and its SWIG environment)
+.tools/
+__pycache__/
+
+# vcpkg: installed trees, build trees, downloads, binary cache, registry cache
+.vcpkg/
+.vcpkg-linux/
+
+# build outputs: generated SWIG sources, CMake build dirs, native artifacts
+build/
+artifacts/
+
+# logs of build.py and docker runs
+/log/
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+TestResults/
+
+# IDE
+.idea/
+.vscode/
